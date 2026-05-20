@@ -1,0 +1,471 @@
+﻿$ErrorActionPreference = "Stop"
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$workspace = $PSScriptRoot
+$outputCsv = Join-Path $workspace "eastmoney-a-share.csv"
+$htmlPath = Join-Path $workspace "index.html"
+$simulationCsv = Join-Path $workspace "simulation-records.csv"
+$priceSnapshotCsv = Join-Path $workspace "price-snapshots.csv"
+
+function Get-EastMoneyJson {
+  param([int]$Page)
+
+  $query = @{
+    pn = "$Page"
+    pz = "200"
+    po = "1"
+    np = "1"
+    ut = "bd1d9ddb04089700cf9c27f6f7426281"
+    fltt = "2"
+    invt = "2"
+    fid = "f3"
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+    fields = "f2,f3,f8,f10,f12,f14,f17,f20,f23,f62,f100"
+  }
+
+  $qs = ($query.GetEnumerator() | ForEach-Object {
+    "{0}={1}" -f [uri]::EscapeDataString($_.Key), [uri]::EscapeDataString($_.Value)
+  }) -join "&"
+
+  $bases = @(
+    "https://push2.eastmoney.com/api/qt/clist/get",
+    "https://push2his.eastmoney.com/api/qt/clist/get",
+    "https://push2delay.eastmoney.com/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/api/qt/clist/get",
+    "https://53.push2.eastmoney.com/api/qt/clist/get",
+    "https://20.push2.eastmoney.com/api/qt/clist/get",
+    "https://60.push2.eastmoney.com/api/qt/clist/get",
+    "http://push2.eastmoney.com/api/qt/clist/get"
+  )
+
+  $lastError = $null
+  foreach ($base in $bases) {
+    try {
+      Write-Host "尝试接口：$base"
+      $result = Invoke-RestMethod -Uri "$base`?$qs" -Headers @{
+        "User-Agent" = "Mozilla/5.0"
+        "Referer" = "https://quote.eastmoney.com/"
+        "Accept" = "application/json,text/plain,*/*"
+      } -TimeoutSec 25
+      if ($null -ne $result -and $null -ne $result.data -and $null -ne $result.data.diff) {
+        return $result
+      }
+      $lastError = "接口返回为空"
+    } catch {
+      $lastError = $_.Exception.Message
+      Write-Host "接口失败：$lastError"
+    }
+  }
+
+  throw "东方财富接口连接失败。最后错误：$lastError。请确认电脑已联网，浏览器能打开 https://quote.eastmoney.com ，如仍失败可稍后重试。"
+}
+
+function Get-SecId {
+  param([string]$Code)
+  if ($Code -match '^6') { return "1.$Code" }
+  return "0.$Code"
+}
+
+function Get-EastMoneyTrackedQuotes {
+  param([string[]]$Codes)
+
+  if ($null -eq $Codes -or $Codes.Count -eq 0) { return @() }
+  $all = New-Object System.Collections.Generic.List[object]
+  $bases = @(
+    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+    "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
+    "https://82.push2.eastmoney.com/api/qt/ulist.np/get",
+    "http://push2.eastmoney.com/api/qt/ulist.np/get"
+  )
+
+  for ($i = 0; $i -lt $Codes.Count; $i += 80) {
+    $chunk = $Codes[$i..([math]::Min($i + 79, $Codes.Count - 1))]
+    $secids = ($chunk | ForEach-Object { Get-SecId $_ }) -join ","
+    $query = @{
+      fltt = "2"
+      invt = "2"
+      fields = "f2,f3,f8,f10,f12,f14,f17,f20,f23,f62,f100"
+      secids = $secids
+    }
+    $qs = ($query.GetEnumerator() | ForEach-Object {
+      "{0}={1}" -f [uri]::EscapeDataString($_.Key), [uri]::EscapeDataString($_.Value)
+    }) -join "&"
+
+    $loaded = $false
+    foreach ($base in $bases) {
+      try {
+        Write-Host "补充历史跟踪行情：$base"
+        $result = Invoke-RestMethod -Uri "$base`?$qs" -Headers @{
+          "User-Agent" = "Mozilla/5.0"
+          "Referer" = "https://quote.eastmoney.com/"
+          "Accept" = "application/json,text/plain,*/*"
+        } -TimeoutSec 25
+        if ($null -ne $result -and $null -ne $result.data -and $null -ne $result.data.diff) {
+          $result.data.diff | ForEach-Object { $all.Add($_) | Out-Null }
+          $loaded = $true
+          break
+        }
+      } catch {
+        Write-Host "历史跟踪行情接口失败：$($_.Exception.Message)"
+      }
+    }
+    if (-not $loaded) {
+      Write-Host "本批历史跟踪股票未能补行情：$($chunk -join ',')"
+    }
+  }
+
+  return $all
+}
+
+function CsvCell {
+  param($Value)
+  $s = if ($null -eq $Value) { "" } else { [string]$Value }
+  if ($s -match '[,"\r\n]') {
+    return '"' + $s.Replace('"', '""') + '"'
+  }
+  return $s
+}
+
+function Num {
+  param($Value)
+  $n = 0.0
+  if ([double]::TryParse([string]$Value, [ref]$n)) { return $n }
+  return $null
+}
+
+function SafeNum {
+  param($Value, [double]$Fallback)
+  if ($null -ne $Value) { return [double]$Value }
+  return $Fallback
+}
+
+function Clamp100 {
+  param([double]$Value)
+  if ($Value -lt 0) { return 0 }
+  if ($Value -gt 100) { return 100 }
+  return $Value
+}
+
+function Get-ShortScore {
+  param($Stock)
+
+  $pb = SafeNum $Stock.PB 8
+  $roe = SafeNum $Stock.ROE 10
+  $revenue = SafeNum $Stock.Revenue 0
+  $profit = SafeNum $Stock.Profit 0
+  $flow = SafeNum $Stock.Flow 0
+  $vol = SafeNum $Stock.VolumeRatio 1
+  $turn = SafeNum $Stock.Turnover 2
+  $change = SafeNum $Stock.Change 0
+
+  $valuation = (Clamp100 ((8 - $pb) / 8 * 45 + 55)) * 0.45 + (Clamp100 (($roe - 8) / 18 * 55 + 45)) * 0.55
+  $financial = Clamp100 (((($revenue / 100000000) + $profit) / 2) * 0.02 + 55)
+  $market = (Clamp100 ($flow * 2 + 50)) * 0.42 + (Clamp100 ($vol * 30 + 40)) * 0.28 + (Clamp100 ($turn * 5 + 45)) * 0.30
+  $industry = 60
+  $riskPenalty = 0
+  if ($pb -gt 12) { $riskPenalty += 8 }
+  if ($change -ge 7) { $riskPenalty += 4 }
+  if ($vol -ge 3) { $riskPenalty += 3 }
+  if ($turn -ge 15) { $riskPenalty += 4 }
+  $riskReward = Clamp100 ($valuation * 0.22 + $financial * 0.22 + $market * 0.42 + $industry * 0.14 - $riskPenalty)
+
+  return $valuation * 0.10 + $financial * 0.16 + $market * 0.48 + $industry * 0.08 + $riskReward * 0.18
+}
+
+function Get-RiskTag {
+  param($Stock)
+  $tags = New-Object System.Collections.Generic.List[string]
+  if ((SafeNum $Stock.Change 0) -ge 6) { $tags.Add("涨幅偏高") }
+  if ((SafeNum $Stock.Change 0) -le -2) { $tags.Add("弱势回落") }
+  if ((SafeNum $Stock.VolumeRatio 1) -ge 2.5) { $tags.Add("量比过热") }
+  if ((SafeNum $Stock.Turnover 2) -ge 12) { $tags.Add("换手过高") }
+  if ((SafeNum $Stock.Flow 0) -gt 0 -and (SafeNum $Stock.Change 0) -ge 5) { $tags.Add("资金追高") }
+  if ($tags.Count -eq 0) { $tags.Add("正常") }
+  return ($tags -join " / ")
+}
+
+Write-Host "正在连接东方财富..."
+$first = Get-EastMoneyJson -Page 1
+$total = [int]$first.data.total
+$pages = [math]::Ceiling($total / 200)
+$items = @()
+$items += $first.data.diff
+
+for ($page = 2; $page -le $pages; $page++) {
+  Start-Sleep -Milliseconds 80
+  $data = Get-EastMoneyJson -Page $page
+  $items += $data.data.diff
+  Write-Host "已读取第 $page / $pages 页"
+}
+
+$header = @(
+  "代码", "名称", "行业", "总市值亿", "是否ST", "连续亏损年数", "收盘价", "实时价格", "涨跌幅", "今日开盘价",
+  "PB", "ROE", "资产负债率", "营收增长", "净利润增长", "毛利率", "经营现金流增长", "主力净流入20日",
+  "量比", "换手率", "委比", "行业空间", "政策支持", "风险说明"
+)
+
+$rows = New-Object System.Collections.Generic.List[string]
+$rows.Add(($header | ForEach-Object { CsvCell $_ }) -join ",")
+$stockObjects = New-Object System.Collections.Generic.List[object]
+
+foreach ($item in $items) {
+  $code = [string]$item.f12
+  $name = [string]$item.f14
+  if ($code -notmatch '^\d{6}$' -or [string]::IsNullOrWhiteSpace($name)) { continue }
+
+  $cap = Num $item.f20
+  $flow = Num $item.f62
+  $capYi = if ($null -ne $cap) { "{0:F2}" -f ($cap / 100000000) } else { "" }
+  $flowYi = if ($null -ne $flow) { "{0:F2}" -f ($flow / 100000000) } else { "" }
+  $isST = if ($name -match '(^|\*)ST') { "是" } else { "否" }
+  $price = Num $item.f2
+  $change = Num $item.f3
+  $open = Num $item.f17
+  $pb = Num $item.f23
+  $vol = Num $item.f10
+  $turn = Num $item.f8
+  $capYiNum = if ($null -ne $cap) { $cap / 100000000 } else { $null }
+  $flowYiNum = if ($null -ne $flow) { $flow / 100000000 } else { $null }
+
+  $row = @(
+    $code,
+    $name,
+    $item.f100,
+    $capYi,
+    $isST,
+    "",
+    $item.f2,
+    $item.f2,
+    $item.f3,
+    $item.f17,
+    $item.f23,
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    $flowYi,
+    $item.f10,
+    $item.f8,
+    "",
+    "",
+    "",
+    "东方财富行情自动更新；ROE、营收增长、净利润增长等财务字段后续补充"
+  )
+  $rows.Add(($row | ForEach-Object { CsvCell $_ }) -join ",")
+  $stockObjects.Add([pscustomobject]@{
+    Code = $code
+    Name = $name
+    Industry = [string]$item.f100
+    CapYi = $capYiNum
+    IsST = ($isST -eq "是")
+    LossYears = $null
+    Close = $price
+    Real = $price
+    Change = $change
+    Open = $open
+    PB = $pb
+    ROE = $null
+    Revenue = $null
+    Profit = $null
+    Flow = $flowYiNum
+    VolumeRatio = $vol
+    Turnover = $turn
+  }) | Out-Null
+}
+
+$existingCodes = New-Object System.Collections.Generic.HashSet[string]
+$stockObjects | ForEach-Object { [void]$existingCodes.Add($_.Code) }
+$trackedCodes = New-Object System.Collections.Generic.HashSet[string]
+if (Test-Path $simulationCsv) {
+  try {
+    Import-Csv -Path $simulationCsv -Encoding UTF8 | ForEach-Object {
+      if ($_.代码 -match '^\d{6}$') { [void]$trackedCodes.Add($_.代码) }
+    }
+  } catch {}
+}
+$missingTrackedCodes = @($trackedCodes | Where-Object { -not $existingCodes.Contains($_) })
+if ($missingTrackedCodes.Count -gt 0) {
+  Write-Host "发现历史记录中有 $($missingTrackedCodes.Count) 只股票不在当天候选池，正在单独补行情..."
+  $trackedItems = Get-EastMoneyTrackedQuotes -Codes $missingTrackedCodes
+  foreach ($item in $trackedItems) {
+    $code = [string]$item.f12
+    $name = [string]$item.f14
+    if ($code -notmatch '^\d{6}$' -or [string]::IsNullOrWhiteSpace($name) -or $existingCodes.Contains($code)) { continue }
+
+    $cap = Num $item.f20
+    $flow = Num $item.f62
+    $capYi = if ($null -ne $cap) { "{0:F2}" -f ($cap / 100000000) } else { "" }
+    $flowYi = if ($null -ne $flow) { "{0:F2}" -f ($flow / 100000000) } else { "" }
+    $isST = if ($name -match '(^|\*)ST') { "是" } else { "否" }
+    $price = Num $item.f2
+    $change = Num $item.f3
+    $open = Num $item.f17
+    $pb = Num $item.f23
+    $vol = Num $item.f10
+    $turn = Num $item.f8
+    $capYiNum = if ($null -ne $cap) { $cap / 100000000 } else { $null }
+    $flowYiNum = if ($null -ne $flow) { $flow / 100000000 } else { $null }
+
+    $row = @(
+      $code,
+      $name,
+      $item.f100,
+      $capYi,
+      $isST,
+      "",
+      $item.f2,
+      $item.f2,
+      $item.f3,
+      $item.f17,
+      $item.f23,
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      $flowYi,
+      $item.f10,
+      $item.f8,
+      "",
+      "",
+      "",
+      "历史模拟记录补充行情；仅用于收益跟踪，不作为当天候选池来源"
+    )
+    $rows.Add(($row | ForEach-Object { CsvCell $_ }) -join ",")
+    $stockObjects.Add([pscustomobject]@{
+      Code = $code
+      Name = $name
+      Industry = [string]$item.f100
+      CapYi = $capYiNum
+      IsST = ($isST -eq "是")
+      LossYears = $null
+      Close = $price
+      Real = $price
+      Change = $change
+      Open = $open
+      PB = $pb
+      ROE = $null
+      Revenue = $null
+      Profit = $null
+      Flow = $flowYiNum
+      VolumeRatio = $vol
+      Turnover = $turn
+      TrackingOnly = $true
+    }) | Out-Null
+    [void]$existingCodes.Add($code)
+  }
+}
+
+[System.IO.File]::WriteAllText($outputCsv, [char]0xFEFF + ($rows -join "`r`n"), [System.Text.Encoding]::UTF8)
+
+$simHeader = @("日期", "排名", "代码", "名称", "策略", "买入参考价", "综合分", "备注")
+if (-not (Test-Path $simulationCsv)) {
+  [System.IO.File]::WriteAllText($simulationCsv, [char]0xFEFF + (($simHeader | ForEach-Object { CsvCell $_ }) -join ","), [System.Text.Encoding]::UTF8)
+}
+
+$today = (Get-Date).ToString("yyyy-MM-dd")
+$keptSimLines = New-Object System.Collections.Generic.List[string]
+try {
+  Import-Csv -Path $simulationCsv -Encoding UTF8 | ForEach-Object {
+    if (-not ($_.日期 -eq $today -and $_.策略 -eq "short")) {
+      $keptRow = @($_.日期, $_.排名, $_.代码, $_.名称, $_.策略, $_.买入参考价, $_.综合分, $_.备注)
+      $keptSimLines.Add(($keptRow | ForEach-Object { CsvCell $_ }) -join ",") | Out-Null
+    }
+  }
+} catch {}
+
+$top5 = $stockObjects |
+  Where-Object {
+    (-not $_.TrackingOnly) -and
+    (-not $_.IsST) -and
+    ($null -ne $_.CapYi -and $_.CapYi -ge 100) -and
+    ($null -eq $_.LossYears -or $_.LossYears -lt 3) -and
+    ($null -ne $_.VolumeRatio -and $_.VolumeRatio -ge 0.3) -and
+    ($null -ne $_.Turnover -and $_.Turnover -ge 0.3) -and
+    ($null -ne $_.Change -and $_.Change -ge -5 -and $_.Change -le 9)
+  } |
+  ForEach-Object {
+    $_ | Add-Member -NotePropertyName Score -NotePropertyValue (Get-ShortScore $_) -Force
+    $_
+  } |
+  Sort-Object Score -Descending |
+  Select-Object -First 5
+
+$newSimLines = New-Object System.Collections.Generic.List[string]
+$rank = 1
+foreach ($stock in $top5) {
+  $buy = if ($null -ne $stock.Real) { $stock.Real } else { $stock.Close }
+  $note = "自动更新保存；" + (Get-RiskTag $stock)
+  $simRow = @($today, $rank, $stock.Code, $stock.Name, "short", ("{0:F2}" -f $buy), ("{0:F1}" -f $stock.Score), $note)
+  $newSimLines.Add(($simRow | ForEach-Object { CsvCell $_ }) -join ",") | Out-Null
+  $rank += 1
+}
+
+$allSimLines = New-Object System.Collections.Generic.List[string]
+$allSimLines.Add(($simHeader | ForEach-Object { CsvCell $_ }) -join ",") | Out-Null
+$keptSimLines | ForEach-Object { $allSimLines.Add($_) | Out-Null }
+$newSimLines | ForEach-Object { $allSimLines.Add($_) | Out-Null }
+[System.IO.File]::WriteAllText($simulationCsv, [char]0xFEFF + ($allSimLines -join "`r`n"), [System.Text.Encoding]::UTF8)
+Write-Host "已保存当天Top5记录: $($newSimLines.Count) 只"
+
+$snapHeader = @("日期", "代码", "名称", "价格")
+$snapshotMap = @{}
+if (Test-Path $priceSnapshotCsv) {
+  try {
+    Import-Csv -Path $priceSnapshotCsv -Encoding UTF8 | ForEach-Object {
+      if ($_.日期 -and $_.代码) {
+        $snapshotMap["$($_.日期)|$($_.代码)"] = @($_.日期, $_.代码, $_.名称, $_.价格)
+      }
+    }
+  } catch {}
+}
+
+try {
+  Import-Csv -Path $simulationCsv -Encoding UTF8 | ForEach-Object {
+    if ($_.日期 -and $_.代码 -and $_.买入参考价) {
+      $snapshotMap["$($_.日期)|$($_.代码)"] = @($_.日期, $_.代码, $_.名称, $_.买入参考价)
+    }
+  }
+} catch {}
+
+foreach ($stock in $stockObjects) {
+  $p = if ($null -ne $stock.Real) { $stock.Real } else { $stock.Close }
+  if ($null -ne $p -and $stock.Code -match '^\d{6}$') {
+    $snapshotMap["$today|$($stock.Code)"] = @($today, $stock.Code, $stock.Name, ("{0:F2}" -f $p))
+  }
+}
+
+$snapLines = New-Object System.Collections.Generic.List[string]
+$snapLines.Add(($snapHeader | ForEach-Object { CsvCell $_ }) -join ",") | Out-Null
+$snapshotMap.GetEnumerator() |
+  Sort-Object Key |
+  ForEach-Object {
+    $snapLines.Add(($_.Value | ForEach-Object { CsvCell $_ }) -join ",") | Out-Null
+  }
+[System.IO.File]::WriteAllText($priceSnapshotCsv, [char]0xFEFF + ($snapLines -join "`r`n"), [System.Text.Encoding]::UTF8)
+Write-Host "已保存价格快照: $($snapshotMap.Count) 条"
+
+$csv = [System.IO.File]::ReadAllText($outputCsv, [System.Text.Encoding]::UTF8)
+$encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($csv))
+$simCsv = [System.IO.File]::ReadAllText($simulationCsv, [System.Text.Encoding]::UTF8)
+$simEncoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($simCsv))
+$priceCsv = [System.IO.File]::ReadAllText($priceSnapshotCsv, [System.Text.Encoding]::UTF8)
+$priceEncoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($priceCsv))
+$html = [System.IO.File]::ReadAllText($htmlPath, [System.Text.Encoding]::UTF8)
+$html = [regex]::Replace($html, "const csvBase64='[^']+';", "const csvBase64='$encoded';")
+$html = [regex]::Replace($html, "const autoSimBase64='[^']*';", "const autoSimBase64='$simEncoded';")
+$html = [regex]::Replace($html, "const autoPriceBase64='[^']*';", "const autoPriceBase64='$priceEncoded';")
+$stamp = (Get-Date).ToString("yyyy/M/d HH:mm:ss")
+$html = [regex]::Replace($html, "版本：2026-05-18-[^。]+。", "版本：2026-05-18-V2东方财富PowerShell更新版，最近更新：$stamp，已自动保存Top5。")
+[System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.Encoding]::UTF8)
+
+Write-Host "东方财富更新完成"
+Write-Host "原始股票: $($items.Count) 只"
+Write-Host "标准股票: $($rows.Count - 1) 只"
+Write-Host "输出文件: $outputCsv"
+Write-Host "页面文件: $htmlPath"
+
